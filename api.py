@@ -1,7 +1,7 @@
 # Set the device with environment, default is cuda:0
 # export SENSEVOICE_DEVICE=cuda:1
 
-import os, re
+import os, re, time, threading
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse
 from typing_extensions import Annotated
@@ -15,6 +15,24 @@ from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
 
 TARGET_FS = 16000
+
+# 空闲超时设置 (秒)
+IDLE_TIMEOUT = int(os.getenv("SENSEVOICE_IDLE_TIMEOUT", 900))  # 默认15分钟
+last_request_time = time.time()
+
+
+def idle_checker():
+    """后台线程: 检测空闲超时,自动退出释放内存"""
+    while True:
+        time.sleep(60)  # 每分钟检查一次
+        idle_time = time.time() - last_request_time
+        if idle_time > IDLE_TIMEOUT:
+            print(f"空闲超时 ({IDLE_TIMEOUT}秒), 自动退出释放内存...")
+            os._exit(0)
+
+
+# 启动空闲检测线程
+threading.Thread(target=idle_checker, daemon=True).start()
 
 
 class Language(str, Enum):
@@ -64,6 +82,9 @@ async def turn_audio_to_text(
     keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
+    global last_request_time
+    last_request_time = time.time()  # 更新最后请求时间
+
     results = []
 
     if not keys:
