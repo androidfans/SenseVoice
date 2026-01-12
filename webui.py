@@ -235,7 +235,7 @@ def launch():
 		
 		fn_button.click(model_inference, inputs=[audio_inputs, language_inputs], outputs=text_outputs)
 
-	demo.launch()
+	demo.launch(server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":

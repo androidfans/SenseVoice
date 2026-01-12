@@ -8,7 +8,9 @@ from typing_extensions import Annotated
 from typing import List
 from enum import Enum
 import torchaudio
-from model import SenseVoiceSmall
+import torch
+import numpy as np
+from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from io import BytesIO
 
@@ -26,10 +28,16 @@ class Language(str, Enum):
 
 
 model_dir = "iic/SenseVoiceSmall"
-m, kwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"))
-m.eval()
+# 使用AutoModel并启用VAD模型,与webui保持一致
+model = AutoModel(
+    model=model_dir,
+    vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    vad_kwargs={"max_single_segment_time": 30000},
+    device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"),
+    trust_remote_code=True,
+)
 
-regex = r"<\|.*\|>"
+regex = r"<\|.*?\|>"
 
 app = FastAPI()
 
@@ -56,43 +64,52 @@ async def turn_audio_to_text(
     keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
-    audios = []
-    for file in files:
-        file_io = BytesIO(await file.read())
-        data_or_path_or_list, audio_fs = torchaudio.load(file_io)
-
-        # transform to target sample
-        if audio_fs != TARGET_FS:
-            resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
-            data_or_path_or_list = resampler(data_or_path_or_list)
-
-        data_or_path_or_list = data_or_path_or_list.mean(0)
-        audios.append(data_or_path_or_list)
-
-    if lang == "":
-        lang = "auto"
+    results = []
 
     if not keys:
         key = [f.filename for f in files]
     else:
         key = keys.split(",")
 
-    res = m.inference(
-        data_in=audios,
-        language=lang,  # "zh", "en", "yue", "ja", "ko", "nospeech"
-        use_itn=False,
-        ban_emo_unk=False,
-        key=key,
-        fs=TARGET_FS,
-        **kwargs,
-    )
-    if len(res) == 0:
-        return {"result": []}
-    for it in res[0]:
-        it["raw_text"] = it["text"]
-        it["clean_text"] = re.sub(regex, "", it["text"], 0, re.MULTILINE)
-        it["text"] = rich_transcription_postprocess(it["text"])
-    return {"result": res[0]}
+    for idx, file in enumerate(files):
+        file_io = BytesIO(await file.read())
+        data_or_path_or_list, audio_fs = torchaudio.load(file_io)
+
+        # transform to target sample and convert to numpy
+        if audio_fs != TARGET_FS:
+            resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
+            data_or_path_or_list = resampler(data_or_path_or_list)
+
+        # convert to mono and numpy array
+        if len(data_or_path_or_list.shape) > 1:
+            data_or_path_or_list = data_or_path_or_list.mean(0)
+
+        input_wav = data_or_path_or_list.numpy().astype(np.float32)
+
+        if lang == "":
+            lang = "auto"
+
+        # 使用AutoModel的generate方法,启用VAD和batch处理
+        res = model.generate(
+            input=input_wav,
+            cache={},
+            language=lang,
+            use_itn=True,
+            batch_size_s=60,
+            merge_vad=True,  # 关键:启用VAD分段合并
+        )
+
+        if len(res) > 0:
+            text = res[0]["text"]
+            result_item = {
+                "key": key[idx] if idx < len(key) else file.filename,
+                "raw_text": text,
+                "clean_text": re.sub(regex, "", text, 0, re.MULTILINE),
+                "text": rich_transcription_postprocess(text)
+            }
+            results.append(result_item)
+
+    return {"result": results}
 
 
 if __name__ == "__main__":
