@@ -87,9 +87,22 @@ res = model.generate(
 
 ## PM2 部署 (Mac)
 
-### 安装PM2
+### 前置依赖
+
+- [uv](https://docs.astral.sh/uv/) — 用于创建 venv 和安装依赖
+- Python 3.11
+- PM2 (`npm install -g pm2`)
+
+### 独立 venv
+
+SenseVoice 使用**独立 venv**（`third_party/sensevoice/SenseVoice/.venv/`），与主项目 venv 隔离，避免 torch/funasr 等重型 ML 依赖污染主项目。
+
+`start_api.sh` 会在首次启动时自动创建 venv 并安装 `requirements.txt` 中的依赖，无需手动操作。如需重建：
+
 ```bash
-npm install -g pm2
+cd third_party/sensevoice/SenseVoice
+rm -rf .venv
+# 下次 pm2 restart 会自动重建
 ```
 
 ### 启动服务
