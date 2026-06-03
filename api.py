@@ -12,9 +12,15 @@ import torch
 import numpy as np
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
+from funasr.utils.vad_utils import merge_vad
 from io import BytesIO
 
 TARGET_FS = 16000
+TIMESTAMP_MERGE_LENGTH_S = 15
+SUBTITLE_MAX_DURATION_S = 8.0
+SUBTITLE_MAX_CHARS = 42
+SUBTITLE_MIN_DURATION_S = 1.0
+SUBTITLE_GAP_S = 0.8
 
 # 空闲超时设置 (秒)
 IDLE_TIMEOUT = int(os.getenv("SENSEVOICE_IDLE_TIMEOUT", 900))  # 默认15分钟
@@ -49,6 +55,7 @@ model_dir = "iic/SenseVoiceSmall"
 # 使用AutoModel并启用VAD模型,与webui保持一致
 model = AutoModel(
     model=model_dir,
+    remote_code="./model.py",
     vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
     vad_kwargs={"max_single_segment_time": 30000},
     device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"),
@@ -58,6 +65,218 @@ model = AutoModel(
 regex = r"<\|.*?\|>"
 
 app = FastAPI()
+
+
+def normalize_language(lang):
+    if isinstance(lang, Language):
+        lang = lang.value
+    return lang or "auto"
+
+
+async def load_upload_audio(file: UploadFile):
+    file_io = BytesIO(await file.read())
+    data_or_path_or_list, audio_fs = torchaudio.load(file_io)
+
+    if audio_fs != TARGET_FS:
+        resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
+        data_or_path_or_list = resampler(data_or_path_or_list)
+
+    if len(data_or_path_or_list.shape) > 1:
+        data_or_path_or_list = data_or_path_or_list.mean(0)
+
+    return data_or_path_or_list.numpy().astype(np.float32)
+
+
+def strip_rich_tags(text: str):
+    return re.sub(regex, "", text or "", 0, re.MULTILINE)
+
+
+def token_to_text(token):
+    token = str(token)
+    token = token.replace("▁", " ")
+    return strip_rich_tags(token)
+
+
+def normalize_segment_text(text):
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:!?，。！？；：、])", r"\1", text)
+    text = re.sub(r"([（(【\[])\s+", r"\1", text)
+    text = re.sub(r"\s+([）)】\]])", r"\1", text)
+    return text
+
+
+def is_sentence_boundary(text):
+    return bool(re.search(r"[。！？!?；;]$", text))
+
+
+def parse_token_timestamps(token_timestamps, offset_seconds=0.0):
+    parsed = []
+    for item in token_timestamps or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+
+        token, start, end = item[0], item[1], item[2]
+        try:
+            start = float(start) + offset_seconds
+            end = float(end) + offset_seconds
+        except (TypeError, ValueError):
+            continue
+
+        text = token_to_text(token)
+        if not text or end < start:
+            continue
+
+        parsed.append({"text": text, "start": start, "end": end})
+
+    return parsed
+
+
+def format_srt_time(seconds):
+    seconds = max(float(seconds), 0.0)
+    total_ms = int(round(seconds * 1000))
+    hours, remainder = divmod(total_ms, 3600 * 1000)
+    minutes, remainder = divmod(remainder, 60 * 1000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def build_subtitle_segments(tokens, fallback_text=""):
+    segments = []
+    current = []
+
+    def flush():
+        if not current:
+            return
+        text = normalize_segment_text("".join(item["text"] for item in current))
+        if not text:
+            current.clear()
+            return
+        segments.append(
+            {
+                "index": len(segments) + 1,
+                "start": round(current[0]["start"], 3),
+                "end": round(max(current[-1]["end"], current[0]["start"] + 0.2), 3),
+                "text": text,
+            }
+        )
+        current.clear()
+
+    for token in tokens:
+        if current and token["start"] - current[-1]["end"] >= SUBTITLE_GAP_S:
+            flush()
+
+        current.append(token)
+        text = normalize_segment_text("".join(item["text"] for item in current))
+        duration = current[-1]["end"] - current[0]["start"]
+        enough_content = len(text) >= 8 or duration >= SUBTITLE_MIN_DURATION_S
+
+        if (
+            (is_sentence_boundary(text) and enough_content)
+            or duration >= SUBTITLE_MAX_DURATION_S
+            or len(text) >= SUBTITLE_MAX_CHARS
+        ):
+            flush()
+
+    flush()
+
+    if not segments and fallback_text:
+        text = rich_transcription_postprocess(strip_rich_tags(fallback_text))
+        if text:
+            segments.append({"index": 1, "start": 0.0, "end": 0.2, "text": text})
+
+    return segments
+
+
+def build_srt(segments):
+    blocks = []
+    for segment in segments:
+        blocks.append(
+            "\n".join(
+                [
+                    str(segment["index"]),
+                    f"{format_srt_time(segment['start'])} --> {format_srt_time(segment['end'])}",
+                    segment["text"],
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+def get_vad_segments(input_wav):
+    if model.vad_model is None:
+        duration_ms = int(len(input_wav) / TARGET_FS * 1000)
+        return [[0, duration_ms]]
+
+    model._reset_runtime_configs()
+    vad_res = model.inference(
+        input_wav,
+        model=model.vad_model,
+        kwargs=model.vad_kwargs,
+        batch_size=1,
+    )
+    if not vad_res:
+        return []
+
+    segments = vad_res[0].get("value", [])
+    return merge_vad(segments, TIMESTAMP_MERGE_LENGTH_S * 1000)
+
+
+def transcribe_segment_with_timestamps(input_wav, language, key):
+    model._reset_runtime_configs()
+    res = model.inference(
+        input_wav,
+        model=model.model,
+        kwargs=model.kwargs,
+        key=key,
+        language=language,
+        use_itn=True,
+        batch_size=1,
+        output_timestamp=True,
+    )
+    return res[0] if res else {"text": "", "timestamp": []}
+
+
+def transcribe_with_subtitles(input_wav, language, key):
+    vad_segments = get_vad_segments(input_wav)
+    token_timestamps = []
+    raw_texts = []
+
+    for idx, (start_ms, end_ms) in enumerate(vad_segments):
+        start_sample = max(int(start_ms * TARGET_FS / 1000), 0)
+        end_sample = min(int(end_ms * TARGET_FS / 1000), len(input_wav))
+        if end_sample <= start_sample:
+            continue
+
+        segment_audio = input_wav[start_sample:end_sample]
+        segment_res = transcribe_segment_with_timestamps(
+            segment_audio,
+            language=language,
+            key=f"{key}_seg_{idx}",
+        )
+        raw_text = segment_res.get("text", "")
+        if raw_text:
+            raw_texts.append(raw_text)
+        token_timestamps.extend(
+            parse_token_timestamps(
+                segment_res.get("timestamp", []),
+                offset_seconds=start_ms / 1000.0,
+            )
+        )
+
+    model._reset_runtime_configs()
+    raw_text = " ".join(raw_texts).strip()
+    text = rich_transcription_postprocess(raw_text)
+    clean_text = strip_rich_tags(raw_text)
+    segments = build_subtitle_segments(token_timestamps, fallback_text=raw_text)
+
+    return {
+        "key": key,
+        "raw_text": raw_text,
+        "clean_text": clean_text,
+        "text": text,
+        "segments": segments,
+        "srt": build_srt(segments),
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -93,28 +312,14 @@ async def turn_audio_to_text(
         key = keys.split(",")
 
     for idx, file in enumerate(files):
-        file_io = BytesIO(await file.read())
-        data_or_path_or_list, audio_fs = torchaudio.load(file_io)
-
-        # transform to target sample and convert to numpy
-        if audio_fs != TARGET_FS:
-            resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
-            data_or_path_or_list = resampler(data_or_path_or_list)
-
-        # convert to mono and numpy array
-        if len(data_or_path_or_list.shape) > 1:
-            data_or_path_or_list = data_or_path_or_list.mean(0)
-
-        input_wav = data_or_path_or_list.numpy().astype(np.float32)
-
-        if lang == "":
-            lang = "auto"
+        input_wav = await load_upload_audio(file)
+        language = normalize_language(lang)
 
         # 使用AutoModel的generate方法,启用VAD和batch处理
         res = model.generate(
             input=input_wav,
             cache={},
-            language=lang,
+            language=language,
             use_itn=True,
             batch_size_s=60,
             merge_vad=True,  # 关键:启用VAD分段合并
@@ -125,10 +330,35 @@ async def turn_audio_to_text(
             result_item = {
                 "key": key[idx] if idx < len(key) else file.filename,
                 "raw_text": text,
-                "clean_text": re.sub(regex, "", text, 0, re.MULTILINE),
+                "clean_text": strip_rich_tags(text),
                 "text": rich_transcription_postprocess(text)
             }
             results.append(result_item)
+
+    return {"result": results}
+
+
+@app.post("/api/v1/asr-with-timestamps")
+async def turn_audio_to_text_with_timestamps(
+    files: Annotated[List[UploadFile], File(description="wav or mp3 audios in 16KHz")],
+    keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
+    lang: Annotated[Language, Form(description="language of audio content")] = "auto",
+):
+    global last_request_time
+    last_request_time = time.time()
+
+    results = []
+    language = normalize_language(lang)
+
+    if not keys:
+        key = [f.filename for f in files]
+    else:
+        key = keys.split(",")
+
+    for idx, file in enumerate(files):
+        input_wav = await load_upload_audio(file)
+        item_key = key[idx] if idx < len(key) else file.filename
+        results.append(transcribe_with_subtitles(input_wav, language, item_key))
 
     return {"result": results}
 
