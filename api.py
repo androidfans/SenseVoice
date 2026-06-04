@@ -2,8 +2,8 @@
 # export SENSEVOICE_DEVICE=cuda:1
 
 import os, re, time, threading
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from typing_extensions import Annotated
 from typing import List
 from enum import Enum
@@ -49,6 +49,11 @@ class Language(str, Enum):
     ja = "ja"
     ko = "ko"
     nospeech = "nospeech"
+
+
+class TimestampResponseFormat(str, Enum):
+    json = "json"
+    srt = "srt"
 
 
 model_dir = "iic/SenseVoiceSmall"
@@ -343,6 +348,10 @@ async def turn_audio_to_text_with_timestamps(
     files: Annotated[List[UploadFile], File(description="wav or mp3 audios in 16KHz")],
     keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
+    response_format: Annotated[
+        TimestampResponseFormat,
+        Form(description="response format: json or srt"),
+    ] = TimestampResponseFormat.json,
 ):
     global last_request_time
     last_request_time = time.time()
@@ -359,6 +368,14 @@ async def turn_audio_to_text_with_timestamps(
         input_wav = await load_upload_audio(file)
         item_key = key[idx] if idx < len(key) else file.filename
         results.append(transcribe_with_subtitles(input_wav, language, item_key))
+
+    if response_format == TimestampResponseFormat.srt:
+        if len(results) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="response_format=srt only supports one audio file per request",
+            )
+        return PlainTextResponse(results[0]["srt"], media_type="application/x-subrip")
 
     return {"result": results}
 
