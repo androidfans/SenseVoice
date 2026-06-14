@@ -1,7 +1,7 @@
 # Set the device with environment, default is cuda:0
 # export SENSEVOICE_DEVICE=cuda:1
 
-import os, re, time, threading
+import os, re, time, threading, subprocess
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from typing_extensions import Annotated
@@ -22,6 +22,9 @@ SUBTITLE_MAX_DURATION_S = 8.0
 SUBTITLE_MAX_CHARS = 42
 SUBTITLE_MIN_DURATION_S = 1.0
 SUBTITLE_GAP_S = 0.8
+FFMPEG_CHUNK_SIZE = 65536
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".ts", ".m4v"}
 
 # 空闲超时设置 (秒)
 IDLE_TIMEOUT = int(os.getenv("SENSEVOICE_IDLE_TIMEOUT", 900))  # 默认15分钟
@@ -79,7 +82,49 @@ def normalize_language(lang):
     return lang or "auto"
 
 
+def extract_audio_from_path(filepath: str):
+    """用 ffmpeg 从文件提取音频，返回 16kHz mono float32 numpy 数组。"""
+    proc = subprocess.Popen(
+        ["ffmpeg", "-i", filepath, "-vn",
+         "-ar", str(TARGET_FS), "-ac", "1", "-f", "s16le", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    pcm_bytes, stderr = proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}): {stderr.decode(errors='replace')}")
+    if not pcm_bytes:
+        raise RuntimeError("ffmpeg produced no audio output")
+    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+async def extract_audio_from_upload(file: UploadFile):
+    """将 UploadFile 写入临时文件后用 ffmpeg 提取音频（MP4 moov atom 需要 seekable 输入）。"""
+    import asyncio, tempfile
+    spooled = file.file
+
+    def _run():
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[1]) as tmp:
+            while True:
+                chunk = spooled.read(FFMPEG_CHUNK_SIZE)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp.flush()
+            return extract_audio_from_path(tmp.name)
+
+    return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+
+def _is_video_file(filename: str) -> bool:
+    if not filename:
+        return False
+    return os.path.splitext(filename.lower())[1] in VIDEO_EXTS
+
+
 async def load_upload_audio(file: UploadFile):
+    if _is_video_file(file.filename):
+        return await extract_audio_from_upload(file)
+
     file_io = BytesIO(await file.read())
     data_or_path_or_list, audio_fs = torchaudio.load(file_io)
 
@@ -382,11 +427,25 @@ async def turn_audio_to_text_with_timestamps(
     return {"result": results}
 
 
+def _run_asr(input_wav, language):
+    """共用的 ASR 推理逻辑。"""
+    language = "auto" if not language else language
+    res = model.generate(
+        input=input_wav,
+        cache={},
+        language=language,
+        use_itn=True,
+        batch_size_s=60,
+        merge_vad=True,
+    )
+    if not res:
+        return ""
+    return rich_transcription_postprocess(strip_rich_tags(res[0]["text"]))
+
+
 def webui_inference(input_wav, language):
     global last_request_time
     last_request_time = time.time()
-
-    language = "auto" if not language else language
 
     if isinstance(input_wav, tuple):
         fs, audio_data = input_wav
@@ -398,19 +457,18 @@ def webui_inference(input_wav, language):
             audio_data = resampler(torch.from_numpy(audio_data).unsqueeze(0))[0].numpy()
         input_wav = audio_data
 
-    res = model.generate(
-        input=input_wav,
-        cache={},
-        language=language,
-        use_itn=True,
-        batch_size_s=60,
-        merge_vad=True,
-    )
+    return _run_asr(input_wav, language)
 
-    if not res:
-        return ""
-    text = res[0]["text"]
-    return rich_transcription_postprocess(strip_rich_tags(text))
+
+def webui_file_inference(filepath, language):
+    """filepath is always a str path — gr.File defaults to type='filepath' in Gradio 4.x+, which this project requires (gr.themes.Soft)."""
+    global last_request_time
+    last_request_time = time.time()
+
+    if not filepath:
+        return "请上传文件"
+    input_wav = extract_audio_from_path(filepath)
+    return _run_asr(input_wav, language)
 
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
@@ -428,8 +486,18 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             )
             run_button = gr.Button("开始识别", variant="primary")
             text_output = gr.Textbox(label="识别结果", lines=6)
+        with gr.Column():
+            file_input = gr.File(label="上传视频/大文件", file_types=[".mp4", ".mov", ".mkv", ".avi", ".webm", ".wav", ".mp3", ".flac", ".m4a"])
+            file_language_input = gr.Dropdown(
+                choices=["auto", "zh", "en", "yue", "ja", "ko"],
+                value="auto",
+                label="语言",
+            )
+            file_run_button = gr.Button("开始识别", variant="primary")
+            file_text_output = gr.Textbox(label="识别结果", lines=6)
 
     run_button.click(webui_inference, inputs=[audio_input, language_input], outputs=text_output)
+    file_run_button.click(webui_file_inference, inputs=[file_input, file_language_input], outputs=file_text_output)
 
 app = gr.mount_gradio_app(app, demo, path="/ui")
 
