@@ -357,6 +357,12 @@ async def turn_audio_to_text_with_timestamps(
     global last_request_time
     last_request_time = time.time()
 
+    if response_format == TimestampResponseFormat.srt and len(files) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format=srt only supports one audio file per request",
+        )
+
     results = []
     language = normalize_language(lang)
 
@@ -371,17 +377,15 @@ async def turn_audio_to_text_with_timestamps(
         results.append(transcribe_with_subtitles(input_wav, language, item_key))
 
     if response_format == TimestampResponseFormat.srt:
-        if len(results) != 1:
-            raise HTTPException(
-                status_code=400,
-                detail="response_format=srt only supports one audio file per request",
-            )
         return PlainTextResponse(results[0]["srt"], media_type="application/x-subrip")
 
     return {"result": results}
 
 
 def webui_inference(input_wav, language):
+    global last_request_time
+    last_request_time = time.time()
+
     language = "auto" if not language else language
 
     if isinstance(input_wav, tuple):
