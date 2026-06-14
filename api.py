@@ -461,6 +461,7 @@ def webui_inference(input_wav, language):
 
 
 def webui_file_inference(filepath, language):
+    """filepath is always a str path — gr.File defaults to type='filepath' in Gradio 4.x+, which this project requires (gr.themes.Soft)."""
     global last_request_time
     last_request_time = time.time()
 
