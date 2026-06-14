@@ -82,63 +82,37 @@ def normalize_language(lang):
     return lang or "auto"
 
 
-def _ffmpeg_to_pcm(write_input, proc):
-    """读取 ffmpeg stdout 返回 PCM numpy 数组，write_input 在单独线程中喂 stdin。"""
-    writer = threading.Thread(target=write_input, daemon=True)
-    writer.start()
-    pcm_bytes = proc.stdout.read()
-    writer.join()
-    proc.wait()
+def extract_audio_from_path(filepath: str):
+    """用 ffmpeg 从文件提取音频，返回 16kHz mono float32 numpy 数组。"""
+    proc = subprocess.Popen(
+        ["ffmpeg", "-i", filepath, "-vn",
+         "-ar", str(TARGET_FS), "-ac", "1", "-f", "s16le", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    pcm_bytes, stderr = proc.communicate()
     if proc.returncode != 0:
-        stderr = proc.stderr.read().decode(errors="replace")
-        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}): {stderr}")
+        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}): {stderr.decode(errors='replace')}")
     if not pcm_bytes:
         raise RuntimeError("ffmpeg produced no audio output")
     return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def _spawn_ffmpeg():
-    return subprocess.Popen(
-        ["ffmpeg", "-i", "pipe:0", "-vn",
-         "-ar", str(TARGET_FS), "-ac", "1", "-f", "s16le", "pipe:1"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-
-
 async def extract_audio_from_upload(file: UploadFile):
-    """流式从 UploadFile 提取音频：分块读文件喂 ffmpeg stdin，不把整个文件读进内存。"""
-    import asyncio
+    """将 UploadFile 写入临时文件后用 ffmpeg 提取音频（MP4 moov atom 需要 seekable 输入）。"""
+    import asyncio, tempfile
     spooled = file.file
 
     def _run():
-        proc = _spawn_ffmpeg()
-
-        def write_input():
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[1]) as tmp:
             while True:
                 chunk = spooled.read(FFMPEG_CHUNK_SIZE)
                 if not chunk:
                     break
-                proc.stdin.write(chunk)
-            proc.stdin.close()
-
-        return _ffmpeg_to_pcm(write_input, proc)
+                tmp.write(chunk)
+            tmp.flush()
+            return extract_audio_from_path(tmp.name)
 
     return await asyncio.get_event_loop().run_in_executor(None, _run)
-
-
-def extract_audio_from_path(filepath: str):
-    proc = _spawn_ffmpeg()
-
-    def write_input():
-        with open(filepath, "rb") as f:
-            while True:
-                chunk = f.read(FFMPEG_CHUNK_SIZE)
-                if not chunk:
-                    break
-                proc.stdin.write(chunk)
-        proc.stdin.close()
-
-    return _ffmpeg_to_pcm(write_input, proc)
 
 
 def _is_video_file(filename: str) -> bool:
