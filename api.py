@@ -10,6 +10,7 @@ from enum import Enum
 import torchaudio
 import torch
 import numpy as np
+import gradio as gr
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from funasr.utils.vad_utils import merge_vad
@@ -378,6 +379,55 @@ async def turn_audio_to_text_with_timestamps(
         return PlainTextResponse(results[0]["srt"], media_type="application/x-subrip")
 
     return {"result": results}
+
+
+def webui_inference(input_wav, language):
+    language = "auto" if not language else language
+
+    if isinstance(input_wav, tuple):
+        fs, audio_data = input_wav
+        audio_data = audio_data.astype(np.float32) / np.iinfo(np.int16).max
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(-1)
+        if fs != TARGET_FS:
+            resampler = torchaudio.transforms.Resample(fs, TARGET_FS)
+            audio_data = resampler(torch.from_numpy(audio_data).unsqueeze(0))[0].numpy()
+        input_wav = audio_data
+
+    res = model.generate(
+        input=input_wav,
+        cache={},
+        language=language,
+        use_itn=True,
+        batch_size_s=60,
+        merge_vad=True,
+    )
+
+    if not res:
+        return ""
+    text = res[0]["text"]
+    return rich_transcription_postprocess(strip_rich_tags(text))
+
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.HTML(
+        "<h2>SenseVoice ASR</h2>"
+        "<p>上传音频或使用麦克风录音，选择语言后点击开始识别。</p>"
+    )
+    with gr.Row():
+        with gr.Column():
+            audio_input = gr.Audio(label="上传音频或使用麦克风")
+            language_input = gr.Dropdown(
+                choices=["auto", "zh", "en", "yue", "ja", "ko"],
+                value="auto",
+                label="语言",
+            )
+            run_button = gr.Button("开始识别", variant="primary")
+            text_output = gr.Textbox(label="识别结果", lines=6)
+
+    run_button.click(webui_inference, inputs=[audio_input, language_input], outputs=text_output)
+
+app = gr.mount_gradio_app(app, demo, path="/ui")
 
 
 if __name__ == "__main__":
