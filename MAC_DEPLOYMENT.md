@@ -28,17 +28,24 @@ docker exec <container> python3 -c "import torch; print(torch.__config__.show())
 | 本机 | 0.009秒 |
 | 容器 | 0.050秒 |
 
-**结论**: Mac上CPU密集型任务不适合用Docker,建议本机直接运行。
+**结论**: Docker 无法使用 Apple Accelerate 或 MPS。Apple Silicon Mac 建议本机直接运行，并优先使用 MPS。
 
 ### 2. CUDA报错
 
 **现象**: 启动时报错 `AssertionError: Torch not compiled with CUDA enabled`
 
-**原因**: 默认device是`cuda:0`,但Mac没有CUDA
+**原因**: `api.py` 的兜底 device 是 `cuda:0`，但 Mac 没有 CUDA。
 
-**解决**: 设置环境变量
+**解决**: 使用 `start_api.sh` 启动时默认使用 MPS，无需额外设置。需要回退到 Accelerate CPU 时设置环境变量：
+
 ```bash
 export SENSEVOICE_DEVICE=cpu
+```
+
+也可以在单次启动时指定：
+
+```bash
+SENSEVOICE_DEVICE=cpu ./start_api.sh
 ```
 
 ### 3. API clean_text字段只返回最后一段
@@ -91,7 +98,8 @@ res = model.generate(
 
 - [uv](https://docs.astral.sh/uv/) — 用于创建 venv 和安装依赖
 - Python 3.11
-- PM2 (`npm install -g pm2`)
+- [Node.js](https://nodejs.org/) 与 PM2 (`npm install --global pm2`)
+- [ffmpeg](https://ffmpeg.org/) — 用于解码 M4A 和视频容器
 
 ### 独立 venv
 
@@ -106,12 +114,36 @@ rm -rf .venv
 ```
 
 ### 启动服务
+
 ```bash
 cd /path/to/SenseVoice
 pm2 start ./start_api.sh --name sensevoice-api
+pm2 save
+```
+
+`start_api.sh` 默认设置 `SENSEVOICE_DEVICE=mps`，服务监听 `http://localhost:50000`。首次启动会自动创建 `.venv`、安装依赖并下载模型，因此耗时会明显长于后续启动。
+
+不经过 PM2、直接在前台运行：
+
+```bash
+cd /path/to/SenseVoice
+./start_api.sh
+```
+
+需要临时切换到 Accelerate CPU：
+
+```bash
+SENSEVOICE_DEVICE=cpu pm2 restart sensevoice-api --update-env
+```
+
+恢复 MPS：
+
+```bash
+SENSEVOICE_DEVICE=mps pm2 restart sensevoice-api --update-env
 ```
 
 ### 设置开机自启
+
 ```bash
 # 保存当前进程列表
 pm2 save
@@ -121,7 +153,14 @@ pm2 startup
 # 按提示执行输出的sudo命令
 ```
 
+开机恢复链路为 `launchd -> pm2 resurrect -> start_api.sh -> uvicorn`。如果 PM2 守护进程已退出，也可以手动恢复：
+
+```bash
+pm2 resurrect
+```
+
 ### 常用命令
+
 ```bash
 pm2 list                    # 查看所有服务
 pm2 monit                   # 监控面板
@@ -144,36 +183,85 @@ pm2 save                    # 保存进程列表(增删服务后执行)
 
 ---
 
-## API使用
+## API 使用
 
-### 接口地址
-```
+服务启动后可访问 `http://localhost:50000/docs` 查看交互式接口文档。
+
+### 普通转写
+
+```text
 POST http://localhost:50000/api/v1/asr
 ```
 
-### 请求参数
-- `files`: 音频文件 (支持mp3, wav等)
-- `lang`: 语言 (`auto`/`zh`/`en`/`ja`/`ko`/`yue`)
+请求参数：
 
-### curl示例
+- `files`: 一个或多个音频/视频文件。常用格式包括 WAV、MP3、M4A、MP4、MOV、MKV 和 WebM
+- `keys`: 可选，多个文件对应的名称，以逗号分隔
+- `lang`: `auto`、`zh`、`en`、`ja`、`ko`、`yue` 或 `nospeech`
+
 ```bash
-curl -X POST "http://localhost:50000/api/v1/asr" \
-  -F "files=@your_audio.mp3" \
+curl "http://localhost:50000/api/v1/asr" \
+  -F "files=@your_audio.m4a" \
   -F "lang=auto"
 ```
 
-### 返回字段
-- `raw_text`: 原始识别文本(含标签)
-- `clean_text`: 清理后的纯文本
-- `text`: 富文本(含emoji标注)
+`result` 数组中的主要字段：
+
+- `raw_text`: 原始识别文本，包含模型标签
+- `clean_text`: 移除标签后的纯文本
+- `text`: 经过后处理的文本，包含情绪、事件等 emoji 标注
+
+### 带逐句时间戳的转写
+
+```text
+POST http://localhost:50000/api/v1/asr-with-timestamps
+```
+
+JSON 格式：
+
+```bash
+curl "http://localhost:50000/api/v1/asr-with-timestamps" \
+  -F "files=@your_audio.m4a" \
+  -F "lang=auto" \
+  -F "response_format=json"
+```
+
+除普通转写字段外，每个结果还包含：
+
+- `segments`: 逐句结果，每项包含 `index`、`start`、`end` 和 `text`
+- `srt`: 同一结果生成的完整 SRT 文本
+
+直接返回 SRT：
+
+```bash
+curl "http://localhost:50000/api/v1/asr-with-timestamps" \
+  -F "files=@your_audio.m4a" \
+  -F "lang=auto" \
+  -F "response_format=srt" \
+  --output subtitles.srt
+```
+
+`response_format=srt` 一次只支持一个文件；JSON 格式支持多个文件。
 
 ---
 
 ## 性能参考
 
-| 测试环境 | 5分钟音频识别耗时 |
-|---------|-----------------|
-| Mac本机 (Apple Silicon) | **3-4秒** |
-| Docker容器 | 13-16秒 |
+不同音频内容、分段数量和首次编译开销都会影响结果，以下数据用于判断部署方式，不代表固定基准。
 
-本机运行比Docker快**3-4倍**,强烈建议Mac上直接本机部署。
+普通转写的迁移实测：
+
+| 音频时长 | Accelerate CPU | MPS 首轮 | MPS 热态 |
+|---|---:|---:|---:|
+| 63 分 45 秒 | 约 59 秒 | 约 17.2 秒 | 约 8.85 秒 |
+
+逐句时间戳接口实测：
+
+| 音频时长 | Accelerate CPU 热态 | MPS 热态 |
+|---|---:|---:|
+| 10 秒 | 约 0.22 秒 | 约 0.18 秒 |
+| 60 秒 | 约 1.18 秒 | 约 0.91 秒 |
+
+MPS 在服务重启后的第一次推理会进行初始化和编译，短音频的首次请求可能比 CPU 慢；长音频或连续请求时，MPS 优势更明显。
+
+历史 Docker 对比中，5 分钟音频在 macOS 原生 Accelerate CPU 上约需 3–4 秒，在 Docker/OpenBLAS 中约需 13–16 秒。由于 Docker 无法使用 Apple Accelerate 和 MPS，Mac 上应优先采用原生部署。
