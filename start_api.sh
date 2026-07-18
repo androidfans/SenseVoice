@@ -1,7 +1,7 @@
 #!/bin/bash
 # SenseVoice API 启动脚本
 
-export SENSEVOICE_DEVICE=cpu
+export SENSEVOICE_DEVICE="${SENSEVOICE_DEVICE:-mps}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
