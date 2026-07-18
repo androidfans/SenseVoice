@@ -24,7 +24,17 @@ SUBTITLE_MIN_DURATION_S = 1.0
 SUBTITLE_GAP_S = 0.8
 FFMPEG_CHUNK_SIZE = 65536
 
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv", ".ts", ".m4v"}
+FFMPEG_INPUT_EXTS = {
+    ".m4a",
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+    ".flv",
+    ".ts",
+    ".m4v",
+}
 
 # 空闲超时设置 (秒)
 IDLE_TIMEOUT = int(os.getenv("SENSEVOICE_IDLE_TIMEOUT", 900))  # 默认15分钟
@@ -98,7 +108,7 @@ def extract_audio_from_path(filepath: str):
 
 
 async def extract_audio_from_upload(file: UploadFile):
-    """将 UploadFile 写入临时文件后用 ffmpeg 提取音频（MP4 moov atom 需要 seekable 输入）。"""
+    """将 UploadFile 写入临时文件后用 ffmpeg 解码（容器格式需要 seekable 输入）。"""
     import asyncio, tempfile
     spooled = file.file
 
@@ -115,14 +125,14 @@ async def extract_audio_from_upload(file: UploadFile):
     return await asyncio.get_event_loop().run_in_executor(None, _run)
 
 
-def _is_video_file(filename: str) -> bool:
+def _requires_ffmpeg(filename: str) -> bool:
     if not filename:
         return False
-    return os.path.splitext(filename.lower())[1] in VIDEO_EXTS
+    return os.path.splitext(filename.lower())[1] in FFMPEG_INPUT_EXTS
 
 
 async def load_upload_audio(file: UploadFile):
-    if _is_video_file(file.filename):
+    if _requires_ffmpeg(file.filename):
         return await extract_audio_from_upload(file)
 
     file_io = BytesIO(await file.read())
@@ -348,7 +358,7 @@ async def root():
 
 @app.post("/api/v1/asr")
 async def turn_audio_to_text(
-    files: Annotated[List[UploadFile], File(description="wav or mp3 audios in 16KHz")],
+    files: Annotated[List[UploadFile], File(description="audio or video files")],
     keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
@@ -391,7 +401,7 @@ async def turn_audio_to_text(
 
 @app.post("/api/v1/asr-with-timestamps")
 async def turn_audio_to_text_with_timestamps(
-    files: Annotated[List[UploadFile], File(description="wav or mp3 audios in 16KHz")],
+    files: Annotated[List[UploadFile], File(description="audio or video files")],
     keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
     response_format: Annotated[
