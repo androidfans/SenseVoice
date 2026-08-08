@@ -82,6 +82,6 @@ def build_huoshan_result(raw_text, token_groups):
         "code": 1000,
         "id": str(uuid.uuid4()),
         "message": "Success",
-        "text": aligned_text,
+        "text": _normalize_text(raw_text),
         "utterances": utterances,
     }

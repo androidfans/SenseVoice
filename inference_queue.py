@@ -22,20 +22,31 @@ class InferenceQueue:
             thread_name_prefix="sensevoice-inference",
         )
 
-    def _submit(self, function):
+    def _submit(self, function, on_started=None):
         started = threading.Event()
+        admission_decided = threading.Event()
+        rejected = threading.Event()
 
         def run():
             started.set()
+            if on_started is not None:
+                on_started()
+            admission_decided.wait()
+            if rejected.is_set():
+                return None
             return function()
 
-        return started, self._executor.submit(run)
+        future = self._executor.submit(run)
+        return started, admission_decided, rejected, future
 
     def run_sync(self, function):
-        started, future = self._submit(function)
+        started, admission_decided, rejected, future = self._submit(function)
         if not started.wait(self.wait_timeout_seconds):
+            rejected.set()
+            admission_decided.set()
             future.cancel()
             raise InferenceQueueTimeout("SenseVoice inference queue timed out")
+        admission_decided.set()
         return future.result()
 
     async def run_async(self, function):
@@ -46,22 +57,26 @@ class InferenceQueue:
             if not started.done():
                 started.set_result(None)
 
-        def run():
-            loop.call_soon_threadsafe(mark_started)
-            return function()
-
-        future = self._executor.submit(run)
+        _started_event, admission_decided, rejected, future = self._submit(
+            function,
+            lambda: loop.call_soon_threadsafe(mark_started),
+        )
         try:
             await asyncio.wait_for(
                 started,
                 self.wait_timeout_seconds,
             )
         except asyncio.TimeoutError as error:
+            rejected.set()
+            admission_decided.set()
             future.cancel()
             raise InferenceQueueTimeout(
                 "SenseVoice inference queue timed out"
             ) from error
         except asyncio.CancelledError:
+            rejected.set()
+            admission_decided.set()
             future.cancel()
             raise
+        admission_decided.set()
         return await asyncio.wrap_future(future)

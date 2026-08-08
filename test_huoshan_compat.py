@@ -56,7 +56,7 @@ class HuoshanCompatibilityTest(unittest.TestCase):
             "Hello world",
             [
                 [{"text": "Hello", "start": 0, "end": 0.5}],
-                [{"text": " world", "start": 1.5, "end": 2}],
+                [{"text": "world", "start": 1.5, "end": 2}],
             ],
         )
 
