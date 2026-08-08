@@ -50,6 +50,12 @@ def build_huoshan_result(raw_text, token_groups):
             )
 
         if not words:
+            if utterances:
+                punctuation = "".join(token["text"] for token in group)
+                previous = utterances[-1]
+                previous["text"] = _normalize_text(previous["text"] + punctuation)
+                previous["end_time"] = _milliseconds(group[-1]["end"])
+                previous["words"][-1]["end_time"] = _milliseconds(group[-1]["end"])
             continue
         utterances.append(
             {
@@ -66,6 +72,6 @@ def build_huoshan_result(raw_text, token_groups):
         "code": 1000,
         "id": str(uuid.uuid4()),
         "message": "Success",
-        "text": "".join(utterance["text"] for utterance in utterances),
+        "text": aligned_text,
         "utterances": utterances,
     }

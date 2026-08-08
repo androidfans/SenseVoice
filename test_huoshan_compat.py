@@ -51,6 +51,31 @@ class HuoshanCompatibilityTest(unittest.TestCase):
                 [[{"text": "别的文本", "start": 0, "end": 1}]],
             )
 
+    def test_build_huoshan_result_preserves_spaces_between_groups(self):
+        result = build_huoshan_result(
+            "Hello world",
+            [
+                [{"text": "Hello", "start": 0, "end": 0.5}],
+                [{"text": " world", "start": 1.5, "end": 2}],
+            ],
+        )
+
+        self.assertEqual(result["text"], "Hello world")
+
+    def test_build_huoshan_result_attaches_punctuation_only_group(self):
+        result = build_huoshan_result(
+            "你好。",
+            [
+                [{"text": "你好", "start": 0, "end": 0.5}],
+                [{"text": "。", "start": 1.5, "end": 1.6}],
+            ],
+        )
+
+        self.assertEqual(result["text"], "你好。")
+        self.assertEqual(result["utterances"][0]["text"], "你好。")
+        self.assertEqual(result["utterances"][0]["end_time"], 1600)
+        self.assertEqual(result["utterances"][0]["words"][0]["end_time"], 1600)
+
     def test_empty_audio_is_a_successful_empty_result(self):
         result = build_huoshan_result("", [])
         self.assertEqual(result["text"], "")
@@ -92,6 +117,35 @@ class HuoshanCompatibilityTest(unittest.TestCase):
         try:
             with self.assertRaises(InferenceQueueTimeout):
                 queue.run_sync(second_ran.set)
+        finally:
+            release.set()
+            first_future.result(timeout=1)
+
+        time.sleep(0.03)
+        self.assertFalse(second_ran.is_set())
+
+    def test_inference_queue_cancels_abandoned_queued_job(self):
+        queue = InferenceQueue(wait_timeout_seconds=1)
+        release = threading.Event()
+        first_started = threading.Event()
+        second_ran = threading.Event()
+
+        def first_job():
+            first_started.set()
+            release.wait(1)
+
+        first_future = queue._executor.submit(first_job)
+        self.assertTrue(first_started.wait(1))
+
+        async def cancel_queued_job():
+            task = asyncio.create_task(queue.run_async(second_ran.set))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        try:
+            asyncio.run(cancel_queued_job())
         finally:
             release.set()
             first_future.result(timeout=1)
