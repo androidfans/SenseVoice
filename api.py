@@ -15,6 +15,8 @@ from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from funasr.utils.vad_utils import merge_vad
 from io import BytesIO
+from inference_queue import InferenceQueue, InferenceQueueTimeout
+from huoshan_compat import build_huoshan_result
 
 TARGET_FS = 16000
 TIMESTAMP_MERGE_LENGTH_S = 15
@@ -84,6 +86,22 @@ model = AutoModel(
 regex = r"<\|.*?\|>"
 
 app = FastAPI()
+inference_queue = InferenceQueue()
+
+
+async def run_inference(function):
+    try:
+        return await inference_queue.run_async(function)
+    except InferenceQueueTimeout as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "2"},
+        ) from exc
+
+
+def run_inference_sync(function):
+    return inference_queue.run_sync(function)
 
 
 def normalize_language(lang):
@@ -201,8 +219,8 @@ def format_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def build_subtitle_segments(tokens, fallback_text=""):
-    segments = []
+def group_subtitle_tokens(tokens):
+    groups = []
     current = []
 
     def flush():
@@ -212,14 +230,7 @@ def build_subtitle_segments(tokens, fallback_text=""):
         if not text:
             current.clear()
             return
-        segments.append(
-            {
-                "index": len(segments) + 1,
-                "start": round(current[0]["start"], 3),
-                "end": round(max(current[-1]["end"], current[0]["start"] + 0.2), 3),
-                "text": text,
-            }
-        )
+        groups.append(list(current))
         current.clear()
 
     for token in tokens:
@@ -239,6 +250,22 @@ def build_subtitle_segments(tokens, fallback_text=""):
             flush()
 
     flush()
+    return groups
+
+
+def build_subtitle_segments(tokens, fallback_text=""):
+    segments = []
+    for group in group_subtitle_tokens(tokens):
+        segments.append(
+            {
+                "index": len(segments) + 1,
+                "start": round(group[0]["start"], 3),
+                "end": round(max(group[-1]["end"], group[0]["start"] + 0.2), 3),
+                "text": normalize_segment_text(
+                    "".join(item["text"] for item in group)
+                ),
+            }
+        )
 
     if not segments and fallback_text:
         text = rich_transcription_postprocess(strip_rich_tags(fallback_text))
@@ -246,6 +273,13 @@ def build_subtitle_segments(tokens, fallback_text=""):
             segments.append({"index": 1, "start": 0.0, "end": 0.2, "text": text})
 
     return segments
+
+
+def build_huoshan_compatible_result(transcription):
+    return build_huoshan_result(
+        strip_rich_tags(transcription["raw_text"]),
+        group_subtitle_tokens(transcription["tokens"]),
+    )
 
 
 def build_srt(segments):
@@ -336,6 +370,7 @@ def transcribe_with_subtitles(input_wav, language, key):
         "clean_text": clean_text,
         "text": text,
         "segments": segments,
+        "tokens": token_timestamps,
         "srt": build_srt(segments),
     }
 
@@ -377,13 +412,15 @@ async def turn_audio_to_text(
         language = normalize_language(lang)
 
         # 使用AutoModel的generate方法,启用VAD和batch处理
-        res = model.generate(
-            input=input_wav,
-            cache={},
-            language=language,
-            use_itn=True,
-            batch_size_s=60,
-            merge_vad=True,  # 关键:启用VAD分段合并
+        res = await run_inference(
+            lambda: model.generate(
+                input=input_wav,
+                cache={},
+                language=language,
+                use_itn=True,
+                batch_size_s=60,
+                merge_vad=True,  # 关键:启用VAD分段合并
+            )
         )
 
         if len(res) > 0:
@@ -429,12 +466,42 @@ async def turn_audio_to_text_with_timestamps(
     for idx, file in enumerate(files):
         input_wav = await load_upload_audio(file)
         item_key = key[idx] if idx < len(key) else file.filename
-        results.append(transcribe_with_subtitles(input_wav, language, item_key))
+        results.append(
+            await run_inference(
+                lambda: transcribe_with_subtitles(input_wav, language, item_key)
+            )
+        )
 
     if response_format == TimestampResponseFormat.srt:
         return PlainTextResponse(results[0]["srt"], media_type="application/x-subrip")
 
     return {"result": results}
+
+
+@app.post("/api/v1/asr-huoshan-compatible")
+async def turn_audio_to_huoshan_compatible_result(
+    files: Annotated[List[UploadFile], File(description="one audio or video file")],
+    lang: Annotated[Language, Form(description="language of audio content")] = "auto",
+):
+    global last_request_time
+    last_request_time = time.time()
+
+    if len(files) != 1:
+        raise HTTPException(status_code=400, detail="exactly one file is required")
+
+    file = files[0]
+    input_wav = await load_upload_audio(file)
+    transcription = await run_inference(
+        lambda: transcribe_with_subtitles(
+            input_wav,
+            normalize_language(lang),
+            file.filename or "audio",
+        )
+    )
+    try:
+        return build_huoshan_compatible_result(transcription)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _run_asr(input_wav, language):
@@ -467,7 +534,7 @@ def webui_inference(input_wav, language):
             audio_data = resampler(torch.from_numpy(audio_data).unsqueeze(0))[0].numpy()
         input_wav = audio_data
 
-    return _run_asr(input_wav, language)
+    return run_inference_sync(lambda: _run_asr(input_wav, language))
 
 
 def webui_file_inference(filepath, language):
@@ -478,7 +545,7 @@ def webui_file_inference(filepath, language):
     if not filepath:
         return "请上传文件"
     input_wav = extract_audio_from_path(filepath)
-    return _run_asr(input_wav, language)
+    return run_inference_sync(lambda: _run_asr(input_wav, language))
 
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
