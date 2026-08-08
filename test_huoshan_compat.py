@@ -104,6 +104,25 @@ class HuoshanCompatibilityTest(unittest.TestCase):
             ["Hello", "world"],
         )
 
+    def test_build_huoshan_result_keeps_punctuation_only_recognition(self):
+        result = build_huoshan_result(
+            "。",
+            [[{"text": "。", "start": 0.2, "end": 0.3}]],
+        )
+
+        self.assertEqual(
+            result["utterances"],
+            [
+                {
+                    "additions": {},
+                    "start_time": 200,
+                    "end_time": 300,
+                    "text": "。",
+                    "words": [],
+                }
+            ],
+        )
+
     def test_empty_audio_is_a_successful_empty_result(self):
         result = build_huoshan_result("", [])
         self.assertEqual(result["text"], "")

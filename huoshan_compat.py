@@ -77,6 +77,19 @@ def build_huoshan_result(raw_text, token_groups):
             }
         )
 
+    if leading_punctuation:
+        utterances.append(
+            {
+                "additions": {},
+                "start_time": _milliseconds(leading_punctuation[0]["start"]),
+                "end_time": _milliseconds(leading_punctuation[-1]["end"]),
+                "text": _normalize_text(
+                    "".join(token["text"] for token in leading_punctuation)
+                ),
+                "words": [],
+            }
+        )
+
     return {
         "additions": {},
         "code": 1000,
