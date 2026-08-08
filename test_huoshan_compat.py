@@ -153,6 +153,32 @@ class HuoshanCompatibilityTest(unittest.TestCase):
         time.sleep(0.03)
         self.assertFalse(second_ran.is_set())
 
+    def test_inference_queue_times_out_async_job_without_running_it(self):
+        queue = InferenceQueue(wait_timeout_seconds=0.02)
+        release = threading.Event()
+        first_started = threading.Event()
+        second_ran = threading.Event()
+
+        def first_job():
+            first_started.set()
+            release.wait(1)
+
+        first_future = queue._executor.submit(first_job)
+        self.assertTrue(first_started.wait(1))
+
+        async def wait_for_timeout():
+            with self.assertRaises(InferenceQueueTimeout):
+                await queue.run_async(second_ran.set)
+
+        try:
+            asyncio.run(wait_for_timeout())
+        finally:
+            release.set()
+            first_future.result(timeout=1)
+
+        time.sleep(0.03)
+        self.assertFalse(second_ran.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()

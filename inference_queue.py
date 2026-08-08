@@ -39,16 +39,29 @@ class InferenceQueue:
         return future.result()
 
     async def run_async(self, function):
-        started, future = self._submit(function)
+        loop = asyncio.get_running_loop()
+        started = loop.create_future()
+
+        def mark_started():
+            if not started.done():
+                started.set_result(None)
+
+        def run():
+            loop.call_soon_threadsafe(mark_started)
+            return function()
+
+        future = self._executor.submit(run)
         try:
-            did_start = await asyncio.to_thread(
-                started.wait,
+            await asyncio.wait_for(
+                started,
                 self.wait_timeout_seconds,
             )
+        except asyncio.TimeoutError as error:
+            future.cancel()
+            raise InferenceQueueTimeout(
+                "SenseVoice inference queue timed out"
+            ) from error
         except asyncio.CancelledError:
             future.cancel()
             raise
-        if not did_start:
-            future.cancel()
-            raise InferenceQueueTimeout("SenseVoice inference queue timed out")
         return await asyncio.wrap_future(future)
