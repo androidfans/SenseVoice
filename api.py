@@ -113,13 +113,27 @@ def normalize_language(lang):
 def extract_audio_from_path(filepath: str):
     """用 ffmpeg 从文件提取音频，返回 16kHz mono float32 numpy 数组。"""
     proc = subprocess.Popen(
-        ["ffmpeg", "-i", filepath, "-vn",
-         "-ar", str(TARGET_FS), "-ac", "1", "-f", "s16le", "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [
+            "ffmpeg",
+            "-i",
+            filepath,
+            "-vn",
+            "-ar",
+            str(TARGET_FS),
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     pcm_bytes, stderr = proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}): {stderr.decode(errors='replace')}")
+        raise RuntimeError(
+            f"ffmpeg failed (exit {proc.returncode}): {stderr.decode(errors='replace')}"
+        )
     if not pcm_bytes:
         raise RuntimeError("ffmpeg produced no audio output")
     return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -128,10 +142,13 @@ def extract_audio_from_path(filepath: str):
 async def extract_audio_from_upload(file: UploadFile):
     """将 UploadFile 写入临时文件后用 ffmpeg 解码（容器格式需要 seekable 输入）。"""
     import asyncio, tempfile
+
     spooled = file.file
 
     def _run():
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[1]) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=os.path.splitext(file.filename or "")[1]
+        ) as tmp:
             while True:
                 chunk = spooled.read(FFMPEG_CHUNK_SIZE)
                 if not chunk:
@@ -157,7 +174,9 @@ async def load_upload_audio(file: UploadFile):
     data_or_path_or_list, audio_fs = torchaudio.load(file_io)
 
     if audio_fs != TARGET_FS:
-        resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=audio_fs, new_freq=TARGET_FS
+        )
         data_or_path_or_list = resampler(data_or_path_or_list)
 
     if len(data_or_path_or_list.shape) > 1:
@@ -261,9 +280,7 @@ def build_subtitle_segments(tokens, fallback_text=""):
                 "index": len(segments) + 1,
                 "start": round(group[0]["start"], 3),
                 "end": round(max(group[-1]["end"], group[0]["start"] + 0.2), 3),
-                "text": normalize_segment_text(
-                    "".join(item["text"] for item in group)
-                ),
+                "text": normalize_segment_text("".join(item["text"] for item in group)),
             }
         )
 
@@ -394,7 +411,9 @@ async def root():
 @app.post("/api/v1/asr")
 async def turn_audio_to_text(
     files: Annotated[List[UploadFile], File(description="audio or video files")],
-    keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
+    keys: Annotated[
+        str, Form(description="name of each audio joined with comma")
+    ] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
     global last_request_time
@@ -429,7 +448,7 @@ async def turn_audio_to_text(
                 "key": key[idx] if idx < len(key) else file.filename,
                 "raw_text": text,
                 "clean_text": strip_rich_tags(text),
-                "text": rich_transcription_postprocess(text)
+                "text": rich_transcription_postprocess(text),
             }
             results.append(result_item)
 
@@ -439,7 +458,9 @@ async def turn_audio_to_text(
 @app.post("/api/v1/asr-with-timestamps")
 async def turn_audio_to_text_with_timestamps(
     files: Annotated[List[UploadFile], File(description="audio or video files")],
-    keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
+    keys: Annotated[
+        str, Form(description="name of each audio joined with comma")
+    ] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
     response_format: Annotated[
         TimestampResponseFormat,
@@ -564,7 +585,20 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             run_button = gr.Button("开始识别", variant="primary")
             text_output = gr.Textbox(label="识别结果", lines=6)
         with gr.Column():
-            file_input = gr.File(label="上传视频/大文件", file_types=[".mp4", ".mov", ".mkv", ".avi", ".webm", ".wav", ".mp3", ".flac", ".m4a"])
+            file_input = gr.File(
+                label="上传视频/大文件",
+                file_types=[
+                    ".mp4",
+                    ".mov",
+                    ".mkv",
+                    ".avi",
+                    ".webm",
+                    ".wav",
+                    ".mp3",
+                    ".flac",
+                    ".m4a",
+                ],
+            )
             file_language_input = gr.Dropdown(
                 choices=["auto", "zh", "en", "yue", "ja", "ko"],
                 value="auto",
@@ -573,8 +607,14 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             file_run_button = gr.Button("开始识别", variant="primary")
             file_text_output = gr.Textbox(label="识别结果", lines=6)
 
-    run_button.click(webui_inference, inputs=[audio_input, language_input], outputs=text_output)
-    file_run_button.click(webui_file_inference, inputs=[file_input, file_language_input], outputs=file_text_output)
+    run_button.click(
+        webui_inference, inputs=[audio_input, language_input], outputs=text_output
+    )
+    file_run_button.click(
+        webui_file_inference,
+        inputs=[file_input, file_language_input],
+        outputs=file_text_output,
+    )
 
 app = gr.mount_gradio_app(app, demo, path="/ui")
 
