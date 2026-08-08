@@ -15,6 +15,8 @@ from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from funasr.utils.vad_utils import merge_vad
 from io import BytesIO
+from inference_queue import InferenceQueue, InferenceQueueTimeout
+from huoshan_compat import build_huoshan_result
 
 TARGET_FS = 16000
 TIMESTAMP_MERGE_LENGTH_S = 15
@@ -84,6 +86,22 @@ model = AutoModel(
 regex = r"<\|.*?\|>"
 
 app = FastAPI()
+inference_queue = InferenceQueue()
+
+
+async def run_inference(function):
+    try:
+        return await inference_queue.run_async(function)
+    except InferenceQueueTimeout as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": "2"},
+        ) from exc
+
+
+def run_inference_sync(function):
+    return inference_queue.run_sync(function)
 
 
 def normalize_language(lang):
@@ -95,13 +113,27 @@ def normalize_language(lang):
 def extract_audio_from_path(filepath: str):
     """用 ffmpeg 从文件提取音频，返回 16kHz mono float32 numpy 数组。"""
     proc = subprocess.Popen(
-        ["ffmpeg", "-i", filepath, "-vn",
-         "-ar", str(TARGET_FS), "-ac", "1", "-f", "s16le", "pipe:1"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [
+            "ffmpeg",
+            "-i",
+            filepath,
+            "-vn",
+            "-ar",
+            str(TARGET_FS),
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     pcm_bytes, stderr = proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed (exit {proc.returncode}): {stderr.decode(errors='replace')}")
+        raise RuntimeError(
+            f"ffmpeg failed (exit {proc.returncode}): {stderr.decode(errors='replace')}"
+        )
     if not pcm_bytes:
         raise RuntimeError("ffmpeg produced no audio output")
     return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -110,10 +142,13 @@ def extract_audio_from_path(filepath: str):
 async def extract_audio_from_upload(file: UploadFile):
     """将 UploadFile 写入临时文件后用 ffmpeg 解码（容器格式需要 seekable 输入）。"""
     import asyncio, tempfile
+
     spooled = file.file
 
     def _run():
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[1]) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=os.path.splitext(file.filename or "")[1]
+        ) as tmp:
             while True:
                 chunk = spooled.read(FFMPEG_CHUNK_SIZE)
                 if not chunk:
@@ -139,7 +174,9 @@ async def load_upload_audio(file: UploadFile):
     data_or_path_or_list, audio_fs = torchaudio.load(file_io)
 
     if audio_fs != TARGET_FS:
-        resampler = torchaudio.transforms.Resample(orig_freq=audio_fs, new_freq=TARGET_FS)
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=audio_fs, new_freq=TARGET_FS
+        )
         data_or_path_or_list = resampler(data_or_path_or_list)
 
     if len(data_or_path_or_list.shape) > 1:
@@ -201,8 +238,8 @@ def format_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def build_subtitle_segments(tokens, fallback_text=""):
-    segments = []
+def group_subtitle_tokens(tokens):
+    groups = []
     current = []
 
     def flush():
@@ -212,14 +249,7 @@ def build_subtitle_segments(tokens, fallback_text=""):
         if not text:
             current.clear()
             return
-        segments.append(
-            {
-                "index": len(segments) + 1,
-                "start": round(current[0]["start"], 3),
-                "end": round(max(current[-1]["end"], current[0]["start"] + 0.2), 3),
-                "text": text,
-            }
-        )
+        groups.append(list(current))
         current.clear()
 
     for token in tokens:
@@ -239,6 +269,20 @@ def build_subtitle_segments(tokens, fallback_text=""):
             flush()
 
     flush()
+    return groups
+
+
+def build_subtitle_segments(tokens, fallback_text=""):
+    segments = []
+    for group in group_subtitle_tokens(tokens):
+        segments.append(
+            {
+                "index": len(segments) + 1,
+                "start": round(group[0]["start"], 3),
+                "end": round(max(group[-1]["end"], group[0]["start"] + 0.2), 3),
+                "text": normalize_segment_text("".join(item["text"] for item in group)),
+            }
+        )
 
     if not segments and fallback_text:
         text = rich_transcription_postprocess(strip_rich_tags(fallback_text))
@@ -246,6 +290,13 @@ def build_subtitle_segments(tokens, fallback_text=""):
             segments.append({"index": 1, "start": 0.0, "end": 0.2, "text": text})
 
     return segments
+
+
+def build_huoshan_compatible_result(transcription):
+    return build_huoshan_result(
+        strip_rich_tags(transcription["raw_text"]),
+        group_subtitle_tokens(transcription["tokens"]),
+    )
 
 
 def build_srt(segments):
@@ -336,6 +387,7 @@ def transcribe_with_subtitles(input_wav, language, key):
         "clean_text": clean_text,
         "text": text,
         "segments": segments,
+        "tokens": token_timestamps,
         "srt": build_srt(segments),
     }
 
@@ -359,7 +411,9 @@ async def root():
 @app.post("/api/v1/asr")
 async def turn_audio_to_text(
     files: Annotated[List[UploadFile], File(description="audio or video files")],
-    keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
+    keys: Annotated[
+        str, Form(description="name of each audio joined with comma")
+    ] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
     global last_request_time
@@ -377,13 +431,15 @@ async def turn_audio_to_text(
         language = normalize_language(lang)
 
         # 使用AutoModel的generate方法,启用VAD和batch处理
-        res = model.generate(
-            input=input_wav,
-            cache={},
-            language=language,
-            use_itn=True,
-            batch_size_s=60,
-            merge_vad=True,  # 关键:启用VAD分段合并
+        res = await run_inference(
+            lambda: model.generate(
+                input=input_wav,
+                cache={},
+                language=language,
+                use_itn=True,
+                batch_size_s=60,
+                merge_vad=True,  # 关键:启用VAD分段合并
+            )
         )
 
         if len(res) > 0:
@@ -392,7 +448,7 @@ async def turn_audio_to_text(
                 "key": key[idx] if idx < len(key) else file.filename,
                 "raw_text": text,
                 "clean_text": strip_rich_tags(text),
-                "text": rich_transcription_postprocess(text)
+                "text": rich_transcription_postprocess(text),
             }
             results.append(result_item)
 
@@ -402,7 +458,9 @@ async def turn_audio_to_text(
 @app.post("/api/v1/asr-with-timestamps")
 async def turn_audio_to_text_with_timestamps(
     files: Annotated[List[UploadFile], File(description="audio or video files")],
-    keys: Annotated[str, Form(description="name of each audio joined with comma")] = None,
+    keys: Annotated[
+        str, Form(description="name of each audio joined with comma")
+    ] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
     response_format: Annotated[
         TimestampResponseFormat,
@@ -429,12 +487,42 @@ async def turn_audio_to_text_with_timestamps(
     for idx, file in enumerate(files):
         input_wav = await load_upload_audio(file)
         item_key = key[idx] if idx < len(key) else file.filename
-        results.append(transcribe_with_subtitles(input_wav, language, item_key))
+        results.append(
+            await run_inference(
+                lambda: transcribe_with_subtitles(input_wav, language, item_key)
+            )
+        )
 
     if response_format == TimestampResponseFormat.srt:
         return PlainTextResponse(results[0]["srt"], media_type="application/x-subrip")
 
     return {"result": results}
+
+
+@app.post("/api/v1/asr-huoshan-compatible")
+async def turn_audio_to_huoshan_compatible_result(
+    files: Annotated[List[UploadFile], File(description="one audio or video file")],
+    lang: Annotated[Language, Form(description="language of audio content")] = "auto",
+):
+    global last_request_time
+    last_request_time = time.time()
+
+    if len(files) != 1:
+        raise HTTPException(status_code=400, detail="exactly one file is required")
+
+    file = files[0]
+    input_wav = await load_upload_audio(file)
+    transcription = await run_inference(
+        lambda: transcribe_with_subtitles(
+            input_wav,
+            normalize_language(lang),
+            file.filename or "audio",
+        )
+    )
+    try:
+        return build_huoshan_compatible_result(transcription)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def _run_asr(input_wav, language):
@@ -467,7 +555,7 @@ def webui_inference(input_wav, language):
             audio_data = resampler(torch.from_numpy(audio_data).unsqueeze(0))[0].numpy()
         input_wav = audio_data
 
-    return _run_asr(input_wav, language)
+    return run_inference_sync(lambda: _run_asr(input_wav, language))
 
 
 def webui_file_inference(filepath, language):
@@ -478,7 +566,7 @@ def webui_file_inference(filepath, language):
     if not filepath:
         return "请上传文件"
     input_wav = extract_audio_from_path(filepath)
-    return _run_asr(input_wav, language)
+    return run_inference_sync(lambda: _run_asr(input_wav, language))
 
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
@@ -497,7 +585,20 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             run_button = gr.Button("开始识别", variant="primary")
             text_output = gr.Textbox(label="识别结果", lines=6)
         with gr.Column():
-            file_input = gr.File(label="上传视频/大文件", file_types=[".mp4", ".mov", ".mkv", ".avi", ".webm", ".wav", ".mp3", ".flac", ".m4a"])
+            file_input = gr.File(
+                label="上传视频/大文件",
+                file_types=[
+                    ".mp4",
+                    ".mov",
+                    ".mkv",
+                    ".avi",
+                    ".webm",
+                    ".wav",
+                    ".mp3",
+                    ".flac",
+                    ".m4a",
+                ],
+            )
             file_language_input = gr.Dropdown(
                 choices=["auto", "zh", "en", "yue", "ja", "ko"],
                 value="auto",
@@ -506,8 +607,14 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             file_run_button = gr.Button("开始识别", variant="primary")
             file_text_output = gr.Textbox(label="识别结果", lines=6)
 
-    run_button.click(webui_inference, inputs=[audio_input, language_input], outputs=text_output)
-    file_run_button.click(webui_file_inference, inputs=[file_input, file_language_input], outputs=file_text_output)
+    run_button.click(
+        webui_inference, inputs=[audio_input, language_input], outputs=text_output
+    )
+    file_run_button.click(
+        webui_file_inference,
+        inputs=[file_input, file_language_input],
+        outputs=file_text_output,
+    )
 
 app = gr.mount_gradio_app(app, demo, path="/ui")
 
