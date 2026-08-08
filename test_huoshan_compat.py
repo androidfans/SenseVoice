@@ -76,6 +76,34 @@ class HuoshanCompatibilityTest(unittest.TestCase):
         self.assertEqual(result["utterances"][0]["end_time"], 1600)
         self.assertEqual(result["utterances"][0]["words"][0]["end_time"], 1600)
 
+    def test_build_huoshan_result_attaches_leading_punctuation_to_first_utterance(self):
+        result = build_huoshan_result(
+            "。你好",
+            [
+                [{"text": "。", "start": 0, "end": 0.1}],
+                [{"text": "你好", "start": 1, "end": 1.5}],
+            ],
+        )
+
+        self.assertEqual(result["utterances"][0]["text"], "。你好")
+        self.assertEqual(result["utterances"][0]["start_time"], 0)
+
+    def test_build_huoshan_result_strips_word_boundary_spaces(self):
+        result = build_huoshan_result(
+            "Hello world",
+            [
+                [
+                    {"text": "Hello", "start": 0, "end": 0.5},
+                    {"text": " world", "start": 0.5, "end": 1},
+                ]
+            ],
+        )
+
+        self.assertEqual(
+            [word["text"] for word in result["utterances"][0]["words"]],
+            ["Hello", "world"],
+        )
+
     def test_empty_audio_is_a_successful_empty_result(self):
         result = build_huoshan_result("", [])
         self.assertEqual(result["text"], "")
