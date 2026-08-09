@@ -105,21 +105,24 @@ threading.Thread(target=idle_checker, daemon=True).start()
 
 async def run_inference(function):
     try:
-        return await inference_queue.run_async(function)
+        return await inference_queue.run_async(lambda: run_and_touch(function))
     except InferenceQueueTimeout as exc:
         raise HTTPException(
             status_code=503,
             detail=str(exc),
             headers={"Retry-After": "2"},
         ) from exc
-    finally:
-        model_lifecycle.touch()
 
 
 def run_inference_sync(function):
+    return inference_queue.run_sync(lambda: run_and_touch(function))
+
+
+def run_and_touch(function):
     try:
-        return inference_queue.run_sync(function)
+        return function()
     finally:
+        # Refresh inside the serialized job before a queued idle check can run.
         model_lifecycle.touch()
 
 
