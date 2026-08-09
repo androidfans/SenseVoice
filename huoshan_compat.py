@@ -92,6 +92,7 @@ def build_huoshan_result(raw_text, token_groups):
 
     return {
         "additions": {},
+        "asr_provider": "sensevoice",
         "code": 1000,
         "id": str(uuid.uuid4()),
         "message": "Success",

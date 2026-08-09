@@ -11,12 +11,12 @@ import torchaudio
 import torch
 import numpy as np
 import gradio as gr
-from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
-from funasr.utils.vad_utils import merge_vad
 from io import BytesIO
 from inference_queue import InferenceQueue, InferenceQueueTimeout
 from huoshan_compat import build_huoshan_result
+from lazy_resource import LazyResource
+from model_process import ModelProcessClient
 
 TARGET_FS = 16000
 TIMESTAMP_MERGE_LENGTH_S = 15
@@ -40,21 +40,7 @@ FFMPEG_INPUT_EXTS = {
 
 # 空闲超时设置 (秒)
 IDLE_TIMEOUT = int(os.getenv("SENSEVOICE_IDLE_TIMEOUT", 900))  # 默认15分钟
-last_request_time = time.time()
-
-
-def idle_checker():
-    """后台线程: 检测空闲超时,自动退出释放内存"""
-    while True:
-        time.sleep(60)  # 每分钟检查一次
-        idle_time = time.time() - last_request_time
-        if idle_time > IDLE_TIMEOUT:
-            print(f"空闲超时 ({IDLE_TIMEOUT}秒), 自动退出释放内存...")
-            os._exit(0)
-
-
-# 启动空闲检测线程
-threading.Thread(target=idle_checker, daemon=True).start()
+IDLE_CHECK_INTERVAL = int(os.getenv("SENSEVOICE_IDLE_CHECK_INTERVAL", 60))
 
 
 class Language(str, Enum):
@@ -73,20 +59,48 @@ class TimestampResponseFormat(str, Enum):
 
 
 model_dir = "iic/SenseVoiceSmall"
-# 使用AutoModel并启用VAD模型,与webui保持一致
-model = AutoModel(
-    model=model_dir,
-    remote_code="./model.py",
-    vad_model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-    vad_kwargs={"max_single_segment_time": 30000},
-    device=os.getenv("SENSEVOICE_DEVICE", "cuda:0"),
-    trust_remote_code=True,
-)
+
+
+def load_model():
+    """Start a disposable process that owns the ASR and VAD models."""
+    return ModelProcessClient(
+        {
+            "model": model_dir,
+            "remote_code": "./model.py",
+            "vad_model": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            "vad_kwargs": {"max_single_segment_time": 30000},
+            "device": os.getenv("SENSEVOICE_DEVICE", "cuda:0"),
+            "trust_remote_code": True,
+            "disable_update": True,
+        }
+    )
+
+
+def release_model(model_process):
+    """Stop the child process so the OS reclaims all model memory."""
+    model_process.close()
+
 
 regex = r"<\|.*?\|>"
 
 app = FastAPI()
 inference_queue = InferenceQueue()
+model_lifecycle = LazyResource(load_model, release_model, IDLE_TIMEOUT)
+
+
+def idle_checker():
+    """Unload idle models without stopping the API process."""
+    while True:
+        time.sleep(IDLE_CHECK_INTERVAL)
+        try:
+            unloaded = inference_queue.run_sync(model_lifecycle.unload_if_idle)
+        except InferenceQueueTimeout:
+            continue
+        if unloaded:
+            print(f"空闲超时 ({IDLE_TIMEOUT}秒), 已卸载模型释放内存...")
+
+
+threading.Thread(target=idle_checker, daemon=True).start()
 
 
 async def run_inference(function):
@@ -98,10 +112,15 @@ async def run_inference(function):
             detail=str(exc),
             headers={"Retry-After": "2"},
         ) from exc
+    finally:
+        model_lifecycle.touch()
 
 
 def run_inference_sync(function):
-    return inference_queue.run_sync(function)
+    try:
+        return inference_queue.run_sync(function)
+    finally:
+        model_lifecycle.touch()
 
 
 def normalize_language(lang):
@@ -314,68 +333,28 @@ def build_srt(segments):
     return "\n\n".join(blocks)
 
 
-def get_vad_segments(input_wav):
-    if model.vad_model is None:
-        duration_ms = int(len(input_wav) / TARGET_FS * 1000)
-        return [[0, duration_ms]]
-
-    model._reset_runtime_configs()
-    vad_res = model.inference(
-        input_wav,
-        model=model.vad_model,
-        kwargs=model.vad_kwargs,
-        batch_size=1,
-    )
-    if not vad_res:
-        return []
-
-    segments = vad_res[0].get("value", [])
-    return merge_vad(segments, TIMESTAMP_MERGE_LENGTH_S * 1000)
-
-
-def transcribe_segment_with_timestamps(input_wav, language, key):
-    model._reset_runtime_configs()
-    res = model.inference(
-        input_wav,
-        model=model.model,
-        kwargs=model.kwargs,
-        key=key,
-        language=language,
-        use_itn=True,
-        batch_size=1,
-        output_timestamp=True,
-    )
-    return res[0] if res else {"text": "", "timestamp": []}
-
-
 def transcribe_with_subtitles(input_wav, language, key):
-    vad_segments = get_vad_segments(input_wav)
     token_timestamps = []
     raw_texts = []
+    segment_results = model_lifecycle.get().transcribe_segments(
+        input_wav,
+        language,
+        key,
+        TARGET_FS,
+        TIMESTAMP_MERGE_LENGTH_S,
+    )
 
-    for idx, (start_ms, end_ms) in enumerate(vad_segments):
-        start_sample = max(int(start_ms * TARGET_FS / 1000), 0)
-        end_sample = min(int(end_ms * TARGET_FS / 1000), len(input_wav))
-        if end_sample <= start_sample:
-            continue
-
-        segment_audio = input_wav[start_sample:end_sample]
-        segment_res = transcribe_segment_with_timestamps(
-            segment_audio,
-            language=language,
-            key=f"{key}_seg_{idx}",
-        )
-        raw_text = segment_res.get("text", "")
+    for segment_result in segment_results:
+        raw_text = segment_result["text"]
         if raw_text:
             raw_texts.append(raw_text)
         token_timestamps.extend(
             parse_token_timestamps(
-                segment_res.get("timestamp", []),
-                offset_seconds=start_ms / 1000.0,
+                segment_result["timestamp"],
+                offset_seconds=segment_result["start_ms"] / 1000.0,
             )
         )
 
-    model._reset_runtime_configs()
     raw_text = " ".join(raw_texts).strip()
     text = rich_transcription_postprocess(raw_text)
     clean_text = strip_rich_tags(raw_text)
@@ -416,8 +395,7 @@ async def turn_audio_to_text(
     ] = None,
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
-    global last_request_time
-    last_request_time = time.time()  # 更新最后请求时间
+    model_lifecycle.touch()
 
     results = []
 
@@ -432,7 +410,7 @@ async def turn_audio_to_text(
 
         # 使用AutoModel的generate方法,启用VAD和batch处理
         res = await run_inference(
-            lambda: model.generate(
+            lambda: model_lifecycle.get().generate(
                 input=input_wav,
                 cache={},
                 language=language,
@@ -467,8 +445,7 @@ async def turn_audio_to_text_with_timestamps(
         Form(description="response format: json or srt"),
     ] = TimestampResponseFormat.json,
 ):
-    global last_request_time
-    last_request_time = time.time()
+    model_lifecycle.touch()
 
     if response_format == TimestampResponseFormat.srt and len(files) != 1:
         raise HTTPException(
@@ -504,8 +481,7 @@ async def turn_audio_to_huoshan_compatible_result(
     files: Annotated[List[UploadFile], File(description="one audio or video file")],
     lang: Annotated[Language, Form(description="language of audio content")] = "auto",
 ):
-    global last_request_time
-    last_request_time = time.time()
+    model_lifecycle.touch()
 
     if len(files) != 1:
         raise HTTPException(status_code=400, detail="exactly one file is required")
@@ -528,7 +504,7 @@ async def turn_audio_to_huoshan_compatible_result(
 def _run_asr(input_wav, language):
     """共用的 ASR 推理逻辑。"""
     language = "auto" if not language else language
-    res = model.generate(
+    res = model_lifecycle.get().generate(
         input=input_wav,
         cache={},
         language=language,
@@ -542,8 +518,7 @@ def _run_asr(input_wav, language):
 
 
 def webui_inference(input_wav, language):
-    global last_request_time
-    last_request_time = time.time()
+    model_lifecycle.touch()
 
     if isinstance(input_wav, tuple):
         fs, audio_data = input_wav
@@ -560,8 +535,7 @@ def webui_inference(input_wav, language):
 
 def webui_file_inference(filepath, language):
     """filepath is always a str path — gr.File defaults to type='filepath' in Gradio 4.x+, which this project requires (gr.themes.Soft)."""
-    global last_request_time
-    last_request_time = time.time()
+    model_lifecycle.touch()
 
     if not filepath:
         return "请上传文件"
