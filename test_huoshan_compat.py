@@ -6,9 +6,59 @@ import unittest
 from huoshan_compat import build_huoshan_result
 from inference_queue import InferenceQueue, InferenceQueueTimeout
 from lazy_resource import LazyResource
+from model_process import ModelProcessClient
 
 
 class HuoshanCompatibilityTest(unittest.TestCase):
+    def test_model_process_recovers_on_request_after_worker_exits(self):
+        class FailedConnection:
+            def send(self, _request):
+                pass
+
+            def recv(self):
+                raise EOFError
+
+            def close(self):
+                pass
+
+        class Process:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+            def join(self, timeout):
+                pass
+
+        client = ModelProcessClient.__new__(ModelProcessClient)
+        client._model_config = {}
+        client._connection = FailedConnection()
+        client._process = Process()
+
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly"):
+            client.generate(input="first")
+
+        class SuccessfulConnection:
+            def send(self, _request):
+                pass
+
+            def recv(self):
+                return True, "recovered"
+
+            def close(self):
+                pass
+
+        def restart():
+            client._connection = SuccessfulConnection()
+            client._process = Process()
+
+        client._start_process = restart
+        self.assertEqual(client.generate(input="second"), "recovered")
+
     def test_build_huoshan_result_matches_expected_contract(self):
         result = build_huoshan_result(
             "全世界95%以上。",

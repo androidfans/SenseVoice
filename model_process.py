@@ -6,12 +6,18 @@ class ModelProcessClient:
     """Run the heavy ASR model in a disposable child process."""
 
     def __init__(self, model_config):
+        self._model_config = model_config
+        self._connection = None
+        self._process = None
+        self._start_process()
+
+    def _start_process(self):
         context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe()
         self._connection = parent_connection
         self._process = context.Process(
             target=_model_worker,
-            args=(child_connection, model_config),
+            args=(child_connection, self._model_config),
             name="sensevoice-model",
             daemon=True,
         )
@@ -19,10 +25,16 @@ class ModelProcessClient:
         child_connection.close()
 
     def _request(self, operation, payload):
-        if not self._process.is_alive():
-            raise RuntimeError("SenseVoice model process is not running")
-        self._connection.send((operation, payload))
-        succeeded, result = self._connection.recv()
+        if self._process is None or not self._process.is_alive():
+            self._discard_process()
+            self._start_process()
+        try:
+            self._connection.send((operation, payload))
+            succeeded, result = self._connection.recv()
+        except (EOFError, OSError):
+            # A broken worker is disposable; the next request starts a clean one.
+            self._discard_process()
+            raise RuntimeError("SenseVoice model process exited unexpectedly") from None
         if not succeeded:
             raise RuntimeError(f"SenseVoice model process failed:\n{result}")
         return result
@@ -43,17 +55,30 @@ class ModelProcessClient:
         )
 
     def close(self):
-        if self._process.is_alive():
+        if self._process is not None and self._process.is_alive():
             try:
                 self._connection.send(("shutdown", None))
                 self._connection.recv()
             except (BrokenPipeError, EOFError):
                 pass
             self._process.join(timeout=10)
-        if self._process.is_alive():
+        if self._process is not None and self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=5)
-        self._connection.close()
+        if self._connection is not None:
+            self._connection.close()
+        self._connection = None
+        self._process = None
+
+    def _discard_process(self):
+        if self._connection is not None:
+            self._connection.close()
+        if self._process is not None:
+            if self._process.is_alive():
+                self._process.terminate()
+            self._process.join(timeout=5)
+        self._connection = None
+        self._process = None
 
 
 def _load_model(model_config):
