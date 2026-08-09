@@ -59,7 +59,7 @@ class ModelProcessClient:
             try:
                 self._connection.send(("shutdown", None))
                 self._connection.recv()
-            except (BrokenPipeError, EOFError):
+            except (EOFError, OSError):
                 pass
             self._process.join(timeout=10)
         if self._process is not None and self._process.is_alive():

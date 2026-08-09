@@ -10,6 +10,36 @@ from model_process import ModelProcessClient
 
 
 class HuoshanCompatibilityTest(unittest.TestCase):
+    def test_model_process_close_handles_shutdown_pipe_error(self):
+        class FailedConnection:
+            def send(self, _request):
+                raise ConnectionResetError
+
+            def close(self):
+                pass
+
+        class Process:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+            def join(self, timeout):
+                pass
+
+        client = ModelProcessClient.__new__(ModelProcessClient)
+        client._connection = FailedConnection()
+        client._process = Process()
+
+        client.close()
+
+        self.assertIsNone(client._connection)
+        self.assertIsNone(client._process)
+
     def test_model_process_recovers_on_request_after_worker_exits(self):
         class FailedConnection:
             def send(self, _request):
