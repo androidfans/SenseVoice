@@ -29,6 +29,7 @@ class ModelProcessClient:
             self._discard_process()
             self._start_process()
         try:
+            # Supported Python runtimes frame Connection payloads well beyond 32 MiB.
             self._connection.send((operation, payload))
             succeeded, result = self._connection.recv()
         except (EOFError, OSError):

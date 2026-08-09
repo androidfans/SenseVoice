@@ -34,8 +34,10 @@ class LazyResource:
 
             resource = self._resource
             self._resource = None
-            self._cleanup(resource)
-            return True
+
+        # Cleanup may wait for a child process; lifecycle state is already detached.
+        self._cleanup(resource)
+        return True
 
     @property
     def is_loaded(self):

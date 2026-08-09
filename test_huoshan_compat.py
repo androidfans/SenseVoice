@@ -362,6 +362,38 @@ class HuoshanCompatibilityTest(unittest.TestCase):
         self.assertEqual(cleanup_count[0], 0)
         self.assertIs(resource.get(), loaded)
 
+    def test_lazy_resource_cleanup_does_not_block_touch(self):
+        now = [0]
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+
+        def cleanup(_resource):
+            cleanup_started.set()
+            release_cleanup.wait(1)
+
+        resource = LazyResource(
+            object,
+            cleanup,
+            idle_timeout_seconds=10,
+            clock=lambda: now[0],
+        )
+        resource.get()
+        now[0] = 11
+
+        unload_thread = threading.Thread(target=resource.unload_if_idle)
+        unload_thread.start()
+        self.assertTrue(cleanup_started.wait(1))
+
+        touch_thread = threading.Thread(target=resource.touch)
+        touch_thread.start()
+        touch_thread.join(timeout=0.1)
+
+        try:
+            self.assertFalse(touch_thread.is_alive())
+        finally:
+            release_cleanup.set()
+            unload_thread.join(timeout=1)
+
 
 if __name__ == "__main__":
     unittest.main()
