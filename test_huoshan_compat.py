@@ -5,9 +5,90 @@ import unittest
 
 from huoshan_compat import build_huoshan_result
 from inference_queue import InferenceQueue, InferenceQueueTimeout
+from lazy_resource import LazyResource
+from model_process import ModelProcessClient
 
 
 class HuoshanCompatibilityTest(unittest.TestCase):
+    def test_model_process_close_handles_shutdown_pipe_error(self):
+        class FailedConnection:
+            def send(self, _request):
+                raise ConnectionResetError
+
+            def close(self):
+                pass
+
+        class Process:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+            def join(self, timeout):
+                pass
+
+        client = ModelProcessClient.__new__(ModelProcessClient)
+        client._connection = FailedConnection()
+        client._process = Process()
+
+        client.close()
+
+        self.assertIsNone(client._connection)
+        self.assertIsNone(client._process)
+
+    def test_model_process_recovers_on_request_after_worker_exits(self):
+        class FailedConnection:
+            def send(self, _request):
+                pass
+
+            def recv(self):
+                raise EOFError
+
+            def close(self):
+                pass
+
+        class Process:
+            def __init__(self):
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+
+            def join(self, timeout):
+                pass
+
+        client = ModelProcessClient.__new__(ModelProcessClient)
+        client._model_config = {}
+        client._connection = FailedConnection()
+        client._process = Process()
+
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly"):
+            client.generate(input="first")
+
+        class SuccessfulConnection:
+            def send(self, _request):
+                pass
+
+            def recv(self):
+                return True, "recovered"
+
+            def close(self):
+                pass
+
+        def restart():
+            client._connection = SuccessfulConnection()
+            client._process = Process()
+
+        client._start_process = restart
+        self.assertEqual(client.generate(input="second"), "recovered")
+
     def test_build_huoshan_result_matches_expected_contract(self):
         result = build_huoshan_result(
             "全世界95%以上。",
@@ -25,6 +106,7 @@ class HuoshanCompatibilityTest(unittest.TestCase):
         self.assertEqual(result["code"], 1000)
         self.assertEqual(result["message"], "Success")
         self.assertEqual(result["additions"], {})
+        self.assertEqual(result["asr_provider"], "sensevoice")
         self.assertEqual(result["text"], "全世界95%以上。")
         self.assertEqual(
             result["utterances"],
@@ -225,6 +307,92 @@ class HuoshanCompatibilityTest(unittest.TestCase):
 
         time.sleep(0.03)
         self.assertFalse(second_ran.is_set())
+
+    def test_lazy_resource_loads_reuses_unloads_and_reloads(self):
+        now = [0]
+        loaded = []
+        cleanup_count = [0]
+
+        def factory():
+            resource = object()
+            loaded.append(resource)
+            return resource
+
+        def cleanup(_resource):
+            cleanup_count[0] += 1
+
+        resource = LazyResource(
+            factory,
+            cleanup,
+            idle_timeout_seconds=10,
+            clock=lambda: now[0],
+        )
+
+        self.assertFalse(resource.is_loaded)
+        first = resource.get()
+        self.assertIs(resource.get(), first)
+        self.assertEqual(len(loaded), 1)
+
+        now[0] = 11
+        self.assertTrue(resource.unload_if_idle())
+        self.assertFalse(resource.is_loaded)
+        self.assertEqual(cleanup_count[0], 1)
+
+        second = resource.get()
+        self.assertIsNot(second, first)
+        self.assertEqual(len(loaded), 2)
+
+    def test_lazy_resource_touch_prevents_idle_unload(self):
+        now = [0]
+        cleanup_count = [0]
+        resource = LazyResource(
+            object,
+            lambda _resource: cleanup_count.__setitem__(0, cleanup_count[0] + 1),
+            idle_timeout_seconds=10,
+            clock=lambda: now[0],
+        )
+        loaded = resource.get()
+
+        now[0] = 9
+        resource.touch()
+        now[0] = 15
+
+        self.assertFalse(resource.unload_if_idle())
+        self.assertTrue(resource.is_loaded)
+        self.assertEqual(cleanup_count[0], 0)
+        self.assertIs(resource.get(), loaded)
+
+    def test_lazy_resource_cleanup_does_not_block_touch(self):
+        now = [0]
+        cleanup_started = threading.Event()
+        release_cleanup = threading.Event()
+
+        def cleanup(_resource):
+            cleanup_started.set()
+            release_cleanup.wait(1)
+
+        resource = LazyResource(
+            object,
+            cleanup,
+            idle_timeout_seconds=10,
+            clock=lambda: now[0],
+        )
+        resource.get()
+        now[0] = 11
+
+        unload_thread = threading.Thread(target=resource.unload_if_idle)
+        unload_thread.start()
+        self.assertTrue(cleanup_started.wait(1))
+
+        touch_thread = threading.Thread(target=resource.touch)
+        touch_thread.start()
+        touch_thread.join(timeout=0.1)
+
+        try:
+            self.assertFalse(touch_thread.is_alive())
+        finally:
+            release_cleanup.set()
+            unload_thread.join(timeout=1)
 
 
 if __name__ == "__main__":
