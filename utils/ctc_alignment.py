@@ -1,5 +1,6 @@
 import torch
 
+
 def ctc_forced_align(
     log_probs: torch.Tensor,
     targets: torch.Tensor,
@@ -23,9 +24,17 @@ def ctc_forced_align(
         blank_id (int, optional): The index of blank symbol in CTC emission. (Default: 0)
         ignore_id (int, optional): The index of ignore symbol in CTC emission. (Default: -1)
     """
+    batch_size, input_time_size, _ = log_probs.size()
+    if input_time_size == 0 or targets.size(1) == 0:
+        return torch.full(
+            (batch_size, input_time_size),
+            blank,
+            device=log_probs.device,
+            dtype=targets.dtype,
+        )
+
     targets[targets == ignore_id] = blank
 
-    batch_size, input_time_size, _ = log_probs.size()
     bsz_indices = torch.arange(batch_size, device=input_lengths.device)
 
     _t_a_r_g_e_t_s_ = torch.cat(
