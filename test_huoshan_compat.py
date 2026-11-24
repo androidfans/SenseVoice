@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from huoshan_compat import build_huoshan_result
 from inference_queue import InferenceQueue, InferenceQueueTimeout
@@ -10,6 +11,12 @@ from model_process import ModelProcessClient
 
 
 class HuoshanCompatibilityTest(unittest.TestCase):
+    def test_inference_queue_defaults_to_ten_minutes(self):
+        with patch.dict("os.environ", {}, clear=True):
+            queue = InferenceQueue()
+
+        self.assertEqual(queue.wait_timeout_seconds, 600)
+
     def test_model_process_close_handles_shutdown_pipe_error(self):
         class FailedConnection:
             def send(self, _request):
