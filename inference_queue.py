@@ -15,7 +15,7 @@ class InferenceQueue:
         self.wait_timeout_seconds = float(
             wait_timeout_seconds
             if wait_timeout_seconds is not None
-            else os.getenv("SENSEVOICE_QUEUE_TIMEOUT", "300")
+            else os.getenv("SENSEVOICE_QUEUE_TIMEOUT", "600")
         )
         self._executor = ThreadPoolExecutor(
             max_workers=1,
